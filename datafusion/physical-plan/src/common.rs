@@ -25,8 +25,9 @@ use super::SendableRecordBatchStream;
 use crate::stream::RecordBatchReceiverStream;
 use crate::{ColumnStatistics, Statistics};
 
-use arrow::array::Array;
+use arrow::array::{Array, StringViewArray};
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
 use datafusion_common::{Result, plan_err};
@@ -190,7 +191,7 @@ pub fn can_project(
                 .max()
                 .is_some_and(|&i| i >= schema.fields().len())
             {
-                Err(arrow::error::ArrowError::SchemaError(format!(
+                Err(ArrowError::SchemaError(format!(
                     "project index {} out of bounds, max field {}",
                     columns.iter().max().unwrap(),
                     schema.fields().len()
@@ -201,6 +202,31 @@ pub fn can_project(
             }
         }
         None => Ok(()),
+    }
+}
+
+/// Return a new `RecordBatch` with [`StringViewArray::gc`] called on such columns (if any).
+pub(crate) fn gc_stringview_arrays(
+    batch: RecordBatch,
+) -> Result<RecordBatch, ArrowError> {
+    let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns());
+
+    let mut arr_mutated = false;
+    for array in batch.columns() {
+        if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>()
+        {
+            let new_array = string_view_array.gc();
+            new_columns.push(Arc::new(new_array));
+            arr_mutated = true;
+        } else {
+            new_columns.push(Arc::clone(array));
+        }
+    }
+
+    if arr_mutated {
+        RecordBatch::try_new(batch.schema(), new_columns)
+    } else {
+        Ok(batch)
     }
 }
 

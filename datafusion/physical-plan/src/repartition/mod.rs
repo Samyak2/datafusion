@@ -31,6 +31,7 @@ use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
 use crate::coalesce::LimitedBatchCoalescer;
+use crate::common::gc_stringview_arrays;
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;
 use crate::metrics::{BaselineMetrics, SpillMetrics};
@@ -611,27 +612,20 @@ impl BatchPartitioner {
                             let columns =
                                 take_arrays(batch.columns(), &indices_array, None)?;
 
-                            let new_columns = columns
-                                .into_iter()
-                                .map(|col| {
-                                    if let Some(sv) =
-                                        col.as_any().downcast_ref::<StringViewArray>()
-                                    {
-                                        Arc::new(sv.gc())
-                                    } else {
-                                        col
-                                    }
-                                })
-                                .collect();
-
                             let mut options = RecordBatchOptions::new();
                             options = options.with_row_count(Some(indices_array.len()));
                             let batch = RecordBatch::try_new_with_options(
                                 batch.schema(),
-                                new_columns,
+                                columns,
                                 &options,
-                            )
-                            .unwrap();
+                            )?;
+
+                            // When `StringViewArray`s are present, the `take_arrays` call above
+                            // re-uses data buffers from the original array. This causes the memory
+                            // pool to count the same data buffers multiple times, once for each
+                            // consumer of the repartition.
+                            // So we gc the output arrays, which creates new data buffers.
+                            let batch = gc_stringview_arrays(batch)?;
 
                             partitioned_batches.push(Ok((partition, batch)));
 

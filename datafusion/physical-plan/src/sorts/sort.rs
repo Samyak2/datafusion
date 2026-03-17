@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
+use crate::common::{gc_stringview_arrays, spawn_buffered};
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
 };
@@ -496,33 +496,10 @@ impl ExternalSorter {
     fn organize_stringview_arrays(
         globally_sorted_batches: &mut Vec<RecordBatch>,
     ) -> Result<()> {
-        let mut organized_batches = Vec::with_capacity(globally_sorted_batches.len());
-
-        for batch in globally_sorted_batches.drain(..) {
-            let mut new_columns: Vec<Arc<dyn Array>> =
-                Vec::with_capacity(batch.num_columns());
-
-            let mut arr_mutated = false;
-            for array in batch.columns() {
-                if let Some(string_view_array) =
-                    array.as_any().downcast_ref::<StringViewArray>()
-                {
-                    let new_array = string_view_array.gc();
-                    new_columns.push(Arc::new(new_array));
-                    arr_mutated = true;
-                } else {
-                    new_columns.push(Arc::clone(array));
-                }
-            }
-
-            let organized_batch = if arr_mutated {
-                RecordBatch::try_new(batch.schema(), new_columns)?
-            } else {
-                batch
-            };
-
-            organized_batches.push(organized_batch);
-        }
+        let organized_batches = globally_sorted_batches
+            .drain(..)
+            .map(gc_stringview_arrays)
+            .collect::<Result<_, _>>()?;
 
         *globally_sorted_batches = organized_batches;
 
