@@ -2652,11 +2652,20 @@ mod tests {
         Ok(())
     }
 
+    /// Ensure that memory tracker usage does not blow up after hash repartition of string view
+    /// arrays.
+    /// See: https://github.com/apache/datafusion/issues/20491
     #[tokio::test]
     async fn hash_repartition_string_view_compaction() -> Result<()> {
         let schema = test_schema_string_view();
         let num_partitions = 8;
-        let batch = create_string_view_batch(800, num_partitions);
+
+        // use batch_size rows per partition to avoid the coalescer from GCing during coalesce.
+        let batch_size = SessionConfig::new().batch_size();
+
+        let expected_rows = batch_size * num_partitions;
+        let batch = create_string_view_batch(expected_rows, num_partitions);
+        let original_size = batch.get_array_memory_size();
         let partitions = vec![vec![batch]];
 
         let output_partitions = repartition(
@@ -2670,9 +2679,19 @@ mod tests {
 
         let total_rows: usize = output_partitions
             .iter()
-            .map(|x| x.iter().map(|x| x.num_rows()).sum::<usize>())
+            .flatten()
+            .map(|batch| batch.num_rows())
             .sum();
-        assert_eq!(total_rows, 800);
+        assert_eq!(total_rows, expected_rows);
+
+        let repartitioned_size: usize = output_partitions
+            .iter()
+            .flatten()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
+        // without GC, the repartitioned_size blows up to 4x (in this case) of the original_size.
+        // So using a safe threshold of 2x.
+        assert!(repartitioned_size <= original_size * 2);
 
         Ok(())
     }
