@@ -45,7 +45,7 @@ use crate::{
     check_if_same_properties,
 };
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, StringViewArray};
+use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::take_arrays;
 use arrow::datatypes::{SchemaRef, UInt32Type};
 use datafusion_common::config::ConfigOptions;
