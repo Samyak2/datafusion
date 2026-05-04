@@ -350,10 +350,9 @@ impl ExecutionPlan for CoalescePartitionsExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RecordBatchStream;
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
-    use crate::execution_plan::{Boundedness, EmissionType};
     use crate::expressions::col;
+    use crate::memory::{LazyBatchGenerator, LazyMemoryExec};
     use crate::repartition::RepartitionExec;
     use crate::test::exec::{
         BlockingExec, PanicExec, assert_strong_count_converges_to_zero,
@@ -365,17 +364,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::Result;
-    use datafusion_common::internal_err;
-    use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_functions_aggregate::count::count_udaf;
-    use datafusion_physical_expr::EquivalenceProperties;
-    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 
-    use futures::{FutureExt, Stream};
-    use std::pin::Pin;
+    use futures::FutureExt;
+    use parking_lot::RwLock;
+    use std::any::Any;
+    use std::fmt;
     use std::sync::{Arc, Weak};
-    use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -437,141 +433,73 @@ mod tests {
             .collect()
     }
 
-    #[derive(Debug)]
-    struct CountingExec {
+    #[derive(Debug, Clone)]
+    struct CountingGenerator {
         schema: SchemaRef,
-        partitions: usize,
-        batches_per_partition: usize,
+        partition: usize,
+        next_batch: usize,
+        max_batches: usize,
         rows_per_batch: usize,
-        plan_ref: Arc<()>,
-        cache: Arc<PlanProperties>,
     }
 
-    impl CountingExec {
+    impl CountingGenerator {
         fn new(
             schema: SchemaRef,
-            partitions: usize,
-            batches_per_partition: usize,
+            partition: usize,
+            max_batches: usize,
             rows_per_batch: usize,
         ) -> Self {
-            let cache = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(Arc::clone(&schema)),
-                Partitioning::UnknownPartitioning(partitions),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            ));
-
             Self {
                 schema,
-                partitions,
-                batches_per_partition,
+                partition,
+                next_batch: 0,
+                max_batches,
                 rows_per_batch,
-                plan_ref: Arc::new(()),
-                cache,
-            }
-        }
-
-        fn refs(&self) -> Weak<()> {
-            Arc::downgrade(&self.plan_ref)
-        }
-    }
-
-    impl DisplayAs for CountingExec {
-        fn fmt_as(
-            &self,
-            t: DisplayFormatType,
-            f: &mut std::fmt::Formatter,
-        ) -> std::fmt::Result {
-            match t {
-                DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                    write!(
-                        f,
-                        "CountingExec: partitions={}, batches_per_partition={}",
-                        self.partitions, self.batches_per_partition
-                    )
-                }
-                DisplayFormatType::TreeRender => {
-                    writeln!(f, "partitions={}", self.partitions)?;
-                    writeln!(f, "batches_per_partition={}", self.batches_per_partition)
-                }
             }
         }
     }
 
-    impl ExecutionPlan for CountingExec {
-        fn name(&self) -> &'static str {
-            "CountingExec"
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.cache
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
-        ) -> Result<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            _: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            internal_err!("Children cannot be replaced in {self:?}")
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            Ok(Box::pin(CountingStream {
-                schema: Arc::clone(&self.schema),
-                next_value: partition * self.batches_per_partition * self.rows_per_batch,
-                remaining: self.batches_per_partition,
-                rows_per_batch: self.rows_per_batch,
-            }))
+    impl fmt::Display for CountingGenerator {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "CountingGenerator: partition={}, max_batches={}, rows_per_batch={}",
+                self.partition, self.max_batches, self.rows_per_batch
+            )
         }
     }
 
-    #[derive(Debug)]
-    struct CountingStream {
-        schema: SchemaRef,
-        next_value: usize,
-        remaining: usize,
-        rows_per_batch: usize,
-    }
+    impl LazyBatchGenerator for CountingGenerator {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
 
-    impl Stream for CountingStream {
-        type Item = Result<RecordBatch>;
-
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
-            if self.remaining == 0 {
-                return Poll::Ready(None);
+        fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+            if self.next_batch == self.max_batches {
+                return Ok(None);
             }
-            self.remaining -= 1;
-            let start = self.next_value as u64;
-            self.next_value += self.rows_per_batch;
+
+            let start = ((self.partition * self.max_batches + self.next_batch)
+                * self.rows_per_batch) as u64;
+            self.next_batch += 1;
+
             let values =
                 UInt64Array::from_iter_values(start..start + self.rows_per_batch as u64);
-            Poll::Ready(Some(Ok(RecordBatch::try_new(
+
+            Ok(Some(RecordBatch::try_new(
                 Arc::clone(&self.schema),
                 vec![Arc::new(values) as ArrayRef],
-            )?)))
+            )?))
         }
-    }
 
-    impl RecordBatchStream for CountingStream {
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
+        fn reset_state(&self) -> Arc<RwLock<dyn LazyBatchGenerator>> {
+            Arc::new(RwLock::new(Self {
+                schema: Arc::clone(&self.schema),
+                partition: self.partition,
+                next_batch: 0,
+                max_batches: self.max_batches,
+                rows_per_batch: self.rows_per_batch,
+            }))
         }
     }
 
@@ -601,15 +529,21 @@ mod tests {
     async fn cancellation_delay_coalesce_repartition() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, true)]));
+        let input_partitions = 2;
         let batches_per_input_partition = 8;
         let rows_per_batch = 128_000;
-        let input = Arc::new(CountingExec::new(
-            Arc::clone(&schema),
-            2,
-            batches_per_input_partition,
-            rows_per_batch,
-        ));
-        let input_refs = input.refs();
+        let generators = (0..input_partitions)
+            .map(|partition| {
+                Arc::new(RwLock::new(CountingGenerator::new(
+                    Arc::clone(&schema),
+                    partition,
+                    batches_per_input_partition,
+                    rows_per_batch,
+                ))) as Arc<RwLock<dyn LazyBatchGenerator>>
+            })
+            .collect();
+        let input = Arc::new(LazyMemoryExec::try_new(Arc::clone(&schema), generators)?);
+        let input_refs = Arc::downgrade(&input);
         let mut plan: Arc<dyn ExecutionPlan> =
             high_cardinality_partial_aggregate(input, &schema)?;
 
