@@ -350,15 +350,33 @@ impl ExecutionPlan for CoalescePartitionsExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RecordBatchStream;
+    use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use crate::execution_plan::{Boundedness, EmissionType};
+    use crate::expressions::col;
+    use crate::repartition::RepartitionExec;
     use crate::test::exec::{
         BlockingExec, PanicExec, assert_strong_count_converges_to_zero,
     };
     use crate::test::{self, assert_is_pending};
     use crate::{collect, common};
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_common::Result;
+    use datafusion_common::internal_err;
+    use datafusion_common::tree_node::TreeNodeRecursion;
+    use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_physical_expr::EquivalenceProperties;
+    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 
-    use futures::FutureExt;
+    use futures::{FutureExt, Stream};
+    use std::pin::Pin;
+    use std::sync::{Arc, Weak};
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn merge() -> Result<()> {
@@ -386,6 +404,259 @@ mod tests {
         // there should be a total of 400 rows (100 per each partition)
         let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(row_count, 400);
+
+        Ok(())
+    }
+
+    async fn wait_for_repartition_drop_times(
+        refs: &[Weak<RepartitionExec>],
+        start: Instant,
+    ) -> Vec<Duration> {
+        let mut drop_times = vec![None; refs.len()];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for (idx, refs) in refs.iter().enumerate() {
+                    if drop_times[idx].is_none() && refs.strong_count() == 0 {
+                        drop_times[idx] = Some(start.elapsed());
+                    }
+                }
+
+                if drop_times.iter().all(Option::is_some) {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop_times
+            .into_iter()
+            .map(|drop_time| drop_time.expect("all repartition refs dropped"))
+            .collect()
+    }
+
+    #[derive(Debug)]
+    struct CountingExec {
+        schema: SchemaRef,
+        partitions: usize,
+        batches_per_partition: usize,
+        rows_per_batch: usize,
+        plan_ref: Arc<()>,
+        cache: Arc<PlanProperties>,
+    }
+
+    impl CountingExec {
+        fn new(
+            schema: SchemaRef,
+            partitions: usize,
+            batches_per_partition: usize,
+            rows_per_batch: usize,
+        ) -> Self {
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(partitions),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+
+            Self {
+                schema,
+                partitions,
+                batches_per_partition,
+                rows_per_batch,
+                plan_ref: Arc::new(()),
+                cache,
+            }
+        }
+
+        fn refs(&self) -> Weak<()> {
+            Arc::downgrade(&self.plan_ref)
+        }
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(
+            &self,
+            t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            match t {
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(
+                        f,
+                        "CountingExec: partitions={}, batches_per_partition={}",
+                        self.partitions, self.batches_per_partition
+                    )
+                }
+                DisplayFormatType::TreeRender => {
+                    writeln!(f, "partitions={}", self.partitions)?;
+                    writeln!(f, "batches_per_partition={}", self.batches_per_partition)
+                }
+            }
+        }
+    }
+
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            internal_err!("Children cannot be replaced in {self:?}")
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(Box::pin(CountingStream {
+                schema: Arc::clone(&self.schema),
+                next_value: partition * self.batches_per_partition * self.rows_per_batch,
+                remaining: self.batches_per_partition,
+                rows_per_batch: self.rows_per_batch,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingStream {
+        schema: SchemaRef,
+        next_value: usize,
+        remaining: usize,
+        rows_per_batch: usize,
+    }
+
+    impl Stream for CountingStream {
+        type Item = Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if self.remaining == 0 {
+                return Poll::Ready(None);
+            }
+            self.remaining -= 1;
+            let start = self.next_value as u64;
+            self.next_value += self.rows_per_batch;
+            let values =
+                UInt64Array::from_iter_values(start..start + self.rows_per_batch as u64);
+            Poll::Ready(Some(Ok(RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(values) as ArrayRef],
+            )?)))
+        }
+    }
+
+    impl RecordBatchStream for CountingStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    fn high_cardinality_partial_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: &SchemaRef,
+    ) -> Result<Arc<AggregateExec>> {
+        let groups =
+            PhysicalGroupBy::new_single(vec![(col("a", schema)?, "a".to_string())]);
+        let count = AggregateExprBuilder::new(count_udaf(), vec![col("a", schema)?])
+            .schema(Arc::clone(schema))
+            .alias("COUNT(a)")
+            .build()?;
+
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            groups,
+            vec![Arc::new(count)],
+            vec![None],
+            input,
+            Arc::clone(schema),
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "temporary diagnostic reproducer for layered cancellation delay"]
+    async fn cancellation_delay_coalesce_repartition() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, true)]));
+        let batches_per_input_partition = 8;
+        let rows_per_batch = 128_000;
+        let input = Arc::new(CountingExec::new(
+            Arc::clone(&schema),
+            2,
+            batches_per_input_partition,
+            rows_per_batch,
+        ));
+        let input_refs = input.refs();
+        let mut plan: Arc<dyn ExecutionPlan> =
+            high_cardinality_partial_aggregate(input, &schema)?;
+
+        let layers = 512;
+        let output_partitions = 32;
+        let mut repartition_refs = Vec::with_capacity(layers);
+
+        for _ in 0..layers {
+            let repartition = Arc::new(RepartitionExec::try_new(
+                plan,
+                Partitioning::RoundRobinBatch(output_partitions),
+            )?);
+            repartition_refs.push(Arc::downgrade(&repartition));
+
+            plan = Arc::new(CoalescePartitionsExec::new(repartition));
+        }
+
+        let handle = tokio::spawn(collect(plan, task_ctx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "query finished before cancellation");
+
+        let start = Instant::now();
+        handle.abort();
+
+        let drop_times = wait_for_repartition_drop_times(&repartition_refs, start).await;
+        let total_elapsed = start.elapsed();
+
+        for (idx, elapsed) in drop_times.iter().enumerate().rev() {
+            let layer_from_top = layers - idx;
+            if layer_from_top != 1 && layer_from_top != layers && layer_from_top % 32 != 0
+            {
+                continue;
+            }
+            println!(
+                "layer_from_top={layer_from_top} repartition_drop_elapsed_ms={}",
+                elapsed.as_millis()
+            );
+        }
+        println!(
+            "layers={layers} output_partitions={output_partitions} input_rows_per_partition={} cancellation_elapsed_ms={}",
+            batches_per_input_partition * rows_per_batch,
+            total_elapsed.as_millis()
+        );
+        println!(
+            "input_plan_strong_count_after_cancel={}",
+            input_refs.strong_count()
+        );
 
         Ok(())
     }
