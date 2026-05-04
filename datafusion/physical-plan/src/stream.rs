@@ -346,9 +346,6 @@ impl RecordBatchReceiverStreamBuilder {
                 Ok(stream) => stream,
             };
 
-            let plan_display = displayable(input.as_ref()).one_line().to_string();
-            drop(input);
-
             // Transfer batches from inner stream to the output tx
             // immediately.
             while let Some(item) = stream.next().await {
@@ -359,7 +356,7 @@ impl RecordBatchReceiverStreamBuilder {
                 if output.send(item).await.is_err() {
                     debug!(
                         "Stopping execution: output is gone, plan cancelling: {}",
-                        plan_display
+                        displayable(input.as_ref()).one_line()
                     );
                     return Ok(());
                 }
@@ -367,7 +364,10 @@ impl RecordBatchReceiverStreamBuilder {
                 // Stop after the first error is encountered (Don't
                 // drive all streams to completion)
                 if is_err {
-                    debug!("Stopping execution: plan returned error: {}", plan_display);
+                    debug!(
+                        "Stopping execution: plan returned error: {}",
+                        displayable(input.as_ref()).one_line()
+                    );
                     return Ok(());
                 }
             }
