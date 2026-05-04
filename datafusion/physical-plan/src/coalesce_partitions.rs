@@ -503,25 +503,47 @@ mod tests {
         }
     }
 
-    fn high_cardinality_partial_aggregate(
+    fn high_cardinality_partitioned_aggregate(
         input: Arc<dyn ExecutionPlan>,
         schema: &SchemaRef,
-    ) -> Result<Arc<AggregateExec>> {
+        output_partitions: usize,
+    ) -> Result<(Arc<dyn ExecutionPlan>, Weak<RepartitionExec>)> {
         let groups =
             PhysicalGroupBy::new_single(vec![(col("a", schema)?, "a".to_string())]);
         let count = AggregateExprBuilder::new(count_udaf(), vec![col("a", schema)?])
             .schema(Arc::clone(schema))
             .alias("COUNT(a)")
-            .build()?;
+            .build()
+            .map(Arc::new)?;
 
-        Ok(Arc::new(AggregateExec::try_new(
+        let partial = Arc::new(AggregateExec::try_new(
             AggregateMode::Partial,
             groups,
-            vec![Arc::new(count)],
+            vec![count],
             vec![None],
             input,
             Arc::clone(schema),
-        )?))
+        )?);
+
+        let hash_exprs = partial.output_group_expr();
+        let final_grouping_set = partial.group_expr().as_final();
+        let final_aggr_expr = partial.aggr_expr().to_vec();
+        let repartition = Arc::new(RepartitionExec::try_new(
+            partial,
+            Partitioning::Hash(hash_exprs, output_partitions),
+        )?);
+        let repartition_ref = Arc::downgrade(&repartition);
+
+        let final_partitioned = Arc::new(AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            final_grouping_set,
+            final_aggr_expr,
+            vec![None],
+            repartition,
+            Arc::clone(schema),
+        )?);
+
+        Ok((final_partitioned, repartition_ref))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -544,22 +566,11 @@ mod tests {
             .collect();
         let input = Arc::new(LazyMemoryExec::try_new(Arc::clone(&schema), generators)?);
         let input_refs = Arc::downgrade(&input);
-        let mut plan: Arc<dyn ExecutionPlan> =
-            high_cardinality_partial_aggregate(input, &schema)?;
-
-        let layers = 512;
         let output_partitions = 32;
-        let mut repartition_refs = Vec::with_capacity(layers);
-
-        for _ in 0..layers {
-            let repartition = Arc::new(RepartitionExec::try_new(
-                plan,
-                Partitioning::RoundRobinBatch(output_partitions),
-            )?);
-            repartition_refs.push(Arc::downgrade(&repartition));
-
-            plan = Arc::new(CoalescePartitionsExec::new(repartition));
-        }
+        let (partitioned_aggregate, repartition_ref) =
+            high_cardinality_partitioned_aggregate(input, &schema, output_partitions)?;
+        let repartition_refs = vec![repartition_ref];
+        let plan = Arc::new(CoalescePartitionsExec::new(partitioned_aggregate));
 
         let handle = tokio::spawn(collect(plan, task_ctx));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -571,19 +582,14 @@ mod tests {
         let drop_times = wait_for_repartition_drop_times(&repartition_refs, start).await;
         let total_elapsed = start.elapsed();
 
-        for (idx, elapsed) in drop_times.iter().enumerate().rev() {
-            let layer_from_top = layers - idx;
-            if layer_from_top != 1 && layer_from_top != layers && layer_from_top % 32 != 0
-            {
-                continue;
-            }
+        for elapsed in drop_times {
             println!(
-                "layer_from_top={layer_from_top} repartition_drop_elapsed_ms={}",
+                "final_partitioned_hash_repartition_drop_elapsed_ms={}",
                 elapsed.as_millis()
             );
         }
         println!(
-            "layers={layers} output_partitions={output_partitions} input_rows_per_partition={} cancellation_elapsed_ms={}",
+            "output_partitions={output_partitions} input_rows_per_partition={} all_repartition_drop_elapsed_ms={}",
             batches_per_input_partition * rows_per_batch,
             total_elapsed.as_millis()
         );
