@@ -353,7 +353,7 @@ mod tests {
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use crate::expressions::col;
     use crate::memory::{LazyBatchGenerator, LazyMemoryExec};
-    use crate::repartition::RepartitionExec;
+    use crate::repartition::{RepartitionExec, task_lifetime_probe};
     use crate::test::exec::{
         BlockingExec, PanicExec, assert_strong_count_converges_to_zero,
     };
@@ -404,20 +404,29 @@ mod tests {
         Ok(())
     }
 
-    async fn wait_for_repartition_drop_times(
-        refs: &[Weak<RepartitionExec>],
+    async fn wait_for_repartition_and_task_drop_times(
+        repartition_refs: &[Weak<RepartitionExec>],
+        task_refs: &[task_lifetime_probe::TaskProbe],
         start: Instant,
-    ) -> Vec<Duration> {
-        let mut drop_times = vec![None; refs.len()];
+    ) -> (Vec<Duration>, Vec<Duration>) {
+        let mut repartition_drop_times = vec![None; repartition_refs.len()];
+        let mut task_drop_times = vec![None; task_refs.len()];
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                for (idx, refs) in refs.iter().enumerate() {
-                    if drop_times[idx].is_none() && refs.strong_count() == 0 {
-                        drop_times[idx] = Some(start.elapsed());
+                for (idx, refs) in repartition_refs.iter().enumerate() {
+                    if repartition_drop_times[idx].is_none() && refs.strong_count() == 0 {
+                        repartition_drop_times[idx] = Some(start.elapsed());
+                    }
+                }
+                for (idx, refs) in task_refs.iter().enumerate() {
+                    if task_drop_times[idx].is_none() && refs.token.strong_count() == 0 {
+                        task_drop_times[idx] = Some(start.elapsed());
                     }
                 }
 
-                if drop_times.iter().all(Option::is_some) {
+                if repartition_drop_times.iter().all(Option::is_some)
+                    && task_drop_times.iter().all(Option::is_some)
+                {
                     break;
                 }
 
@@ -427,10 +436,15 @@ mod tests {
         .await
         .unwrap();
 
-        drop_times
+        let repartition_drop_times = repartition_drop_times
             .into_iter()
             .map(|drop_time| drop_time.expect("all repartition refs dropped"))
-            .collect()
+            .collect();
+        let task_drop_times = task_drop_times
+            .into_iter()
+            .map(|drop_time| drop_time.expect("all repartition task refs dropped"))
+            .collect();
+        (repartition_drop_times, task_drop_times)
     }
 
     fn high_cardinality_partitioned_aggregate(
@@ -549,6 +563,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "temporary diagnostic reproducer for layered cancellation delay"]
     async fn cancellation_delay_coalesce_repartition() -> Result<()> {
+        task_lifetime_probe::clear();
+
         let task_ctx = Arc::new(TaskContext::default());
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, true)]));
         let input_partitions = 2;
@@ -582,12 +598,25 @@ mod tests {
         let handle = tokio::spawn(collect(plan, task_ctx));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "query finished before cancellation");
+        let task_refs = task_lifetime_probe::snapshot();
 
         let start = Instant::now();
         handle.abort();
 
-        let drop_times = wait_for_repartition_drop_times(&repartition_refs, start).await;
+        let (drop_times, task_drop_times) = wait_for_repartition_and_task_drop_times(
+            &repartition_refs,
+            &task_refs,
+            start,
+        )
+        .await;
         let total_elapsed = start.elapsed();
+        let max_repartition_drop =
+            drop_times.iter().copied().max().unwrap_or(Duration::ZERO);
+        let max_task_drop = task_drop_times
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(Duration::ZERO);
 
         for (idx, elapsed) in drop_times.into_iter().enumerate() {
             let repartition = match idx {
@@ -600,11 +629,25 @@ mod tests {
                 elapsed.as_millis()
             );
         }
+        for (task, elapsed) in task_refs.iter().zip(task_drop_times) {
+            println!(
+                "repartition_task_group={} input_partition={} kind={} drop_elapsed_ms={}",
+                task.group_id,
+                task.input_partition,
+                task.task_kind,
+                elapsed.as_millis()
+            );
+        }
         println!(
-            "output_partitions={output_partitions} input_rows_per_partition={} all_repartition_drop_elapsed_ms={}",
+            "output_partitions={output_partitions} input_rows_per_partition={} all_repartition_operator_drop_elapsed_ms={}",
             batches_per_input_partition * rows_per_batch,
-            total_elapsed.as_millis()
+            max_repartition_drop.as_millis()
         );
+        println!(
+            "all_repartition_task_drop_elapsed_ms={}",
+            max_task_drop.as_millis()
+        );
+        println!("all_observed_drop_elapsed_ms={}", total_elapsed.as_millis());
         println!(
             "input_plan_strong_count_after_cancel={}",
             input_refs.strong_count()
