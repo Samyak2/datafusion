@@ -22,7 +22,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::coop::cooperative;
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::{
@@ -354,7 +353,7 @@ impl ExecutionPlan for LazyMemoryExec {
             generator,
             baseline_metrics,
         };
-        Ok(Box::pin(cooperative(stream)))
+        Ok(Box::pin(stream))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

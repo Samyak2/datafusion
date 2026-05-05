@@ -80,6 +80,51 @@ use distributor_channels::{
     DistributionReceiver, DistributionSender, channels, partition_aware_channels,
 };
 
+#[cfg(test)]
+pub(crate) mod task_lifetime_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+
+    static NEXT_GROUP_ID: AtomicUsize = AtomicUsize::new(0);
+    static TASKS: LazyLock<Mutex<Vec<TaskProbe>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct TaskProbe {
+        pub(crate) group_id: usize,
+        pub(crate) input_partition: usize,
+        pub(crate) task_kind: &'static str,
+        pub(crate) token: Weak<()>,
+    }
+
+    pub(crate) fn clear() {
+        NEXT_GROUP_ID.store(0, Ordering::SeqCst);
+        TASKS.lock().unwrap().clear();
+    }
+
+    pub(crate) fn next_group_id() -> usize {
+        NEXT_GROUP_ID.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn register(
+        group_id: usize,
+        input_partition: usize,
+        task_kind: &'static str,
+        token: &Arc<()>,
+    ) {
+        TASKS.lock().unwrap().push(TaskProbe {
+            group_id,
+            input_partition,
+            task_kind,
+            token: Arc::downgrade(token),
+        });
+    }
+
+    pub(crate) fn snapshot() -> Vec<TaskProbe> {
+        TASKS.lock().unwrap().clone()
+    }
+}
+
 /// A batch in the repartition queue - either in memory or spilled to disk.
 ///
 /// This enum represents the two states a batch can be in during repartitioning.
@@ -361,6 +406,8 @@ impl RepartitionExecState {
 
         // launch one async task per *input* partition
         let mut spawned_tasks = Vec::with_capacity(num_input_partitions);
+        #[cfg(test)]
+        let task_group_id = task_lifetime_probe::next_group_id();
         for (i, (stream, metrics)) in
             std::mem::take(streams_and_metrics).into_iter().enumerate()
         {
@@ -388,7 +435,7 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
-            let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
+            let pull_from_input = RepartitionExec::pull_from_input(
                 stream,
                 txs,
                 partitioning.clone(),
@@ -396,12 +443,38 @@ impl RepartitionExecState {
                 // preserve_order depends on partition index to start from 0
                 if preserve_order { 0 } else { i },
                 num_input_partitions,
-            ));
+            );
+            #[cfg(test)]
+            let pull_from_input = {
+                let token = Arc::new(());
+                task_lifetime_probe::register(
+                    task_group_id,
+                    i,
+                    "pull_from_input",
+                    &token,
+                );
+                async move {
+                    let _task_lifetime = token;
+                    pull_from_input.await
+                }
+            };
+
+            let input_task = SpawnedTask::spawn(pull_from_input);
 
             // In a separate task, wait for each input to be done
             // (and pass along any errors, including panic!s)
-            let wait_for_task =
-                SpawnedTask::spawn(RepartitionExec::wait_for_task(input_task, senders));
+            let wait_for_task = RepartitionExec::wait_for_task(input_task, senders);
+            #[cfg(test)]
+            let wait_for_task = {
+                let token = Arc::new(());
+                task_lifetime_probe::register(task_group_id, i, "wait_for_task", &token);
+                async move {
+                    let _task_lifetime = token;
+                    wait_for_task.await
+                }
+            };
+
+            let wait_for_task = SpawnedTask::spawn(wait_for_task);
             spawned_tasks.push(wait_for_task);
         }
         *self = Self::ConsumingInputStreams(ConsumingInputStreamsState {

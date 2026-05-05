@@ -350,15 +350,29 @@ impl ExecutionPlan for CoalescePartitionsExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use crate::expressions::col;
+    use crate::memory::{LazyBatchGenerator, LazyMemoryExec};
+    use crate::repartition::{RepartitionExec, task_lifetime_probe};
     use crate::test::exec::{
         BlockingExec, PanicExec, assert_strong_count_converges_to_zero,
     };
     use crate::test::{self, assert_is_pending};
     use crate::{collect, common};
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_common::Result;
+    use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 
     use futures::FutureExt;
+    use parking_lot::RwLock;
+    use std::any::Any;
+    use std::fmt;
+    use std::sync::{Arc, Weak};
+    use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn merge() -> Result<()> {
@@ -386,6 +400,258 @@ mod tests {
         // there should be a total of 400 rows (100 per each partition)
         let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(row_count, 400);
+
+        Ok(())
+    }
+
+    async fn wait_for_repartition_and_task_drop_times(
+        repartition_refs: &[Weak<RepartitionExec>],
+        task_refs: &[task_lifetime_probe::TaskProbe],
+        start: Instant,
+    ) -> (Vec<Duration>, Vec<Duration>) {
+        let mut repartition_drop_times = vec![None; repartition_refs.len()];
+        let mut task_drop_times = vec![None; task_refs.len()];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for (idx, refs) in repartition_refs.iter().enumerate() {
+                    if repartition_drop_times[idx].is_none() && refs.strong_count() == 0 {
+                        repartition_drop_times[idx] = Some(start.elapsed());
+                    }
+                }
+                for (idx, refs) in task_refs.iter().enumerate() {
+                    if task_drop_times[idx].is_none() && refs.token.strong_count() == 0 {
+                        task_drop_times[idx] = Some(start.elapsed());
+                    }
+                }
+
+                if repartition_drop_times.iter().all(Option::is_some)
+                    && task_drop_times.iter().all(Option::is_some)
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let repartition_drop_times = repartition_drop_times
+            .into_iter()
+            .map(|drop_time| drop_time.expect("all repartition refs dropped"))
+            .collect();
+        let task_drop_times = task_drop_times
+            .into_iter()
+            .map(|drop_time| drop_time.expect("all repartition task refs dropped"))
+            .collect();
+        (repartition_drop_times, task_drop_times)
+    }
+
+    fn high_cardinality_partitioned_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: &SchemaRef,
+        output_partitions: usize,
+    ) -> Result<(Arc<dyn ExecutionPlan>, Weak<RepartitionExec>)> {
+        let groups =
+            PhysicalGroupBy::new_single(vec![(col("a", schema)?, "a".to_string())]);
+        let count = AggregateExprBuilder::new(count_udaf(), vec![col("a", schema)?])
+            .schema(Arc::clone(schema))
+            .alias("COUNT(a)")
+            .build()
+            .map(Arc::new)?;
+
+        let partial = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            groups,
+            vec![count],
+            vec![None],
+            input,
+            Arc::clone(schema),
+        )?);
+
+        let hash_exprs = partial.output_group_expr();
+        let final_grouping_set = partial.group_expr().as_final();
+        let final_aggr_expr = partial.aggr_expr().to_vec();
+        let repartition = Arc::new(RepartitionExec::try_new(
+            partial,
+            Partitioning::Hash(hash_exprs, output_partitions),
+        )?);
+        let repartition_ref = Arc::downgrade(&repartition);
+
+        let final_partitioned = Arc::new(AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            final_grouping_set,
+            final_aggr_expr,
+            vec![None],
+            repartition,
+            Arc::clone(schema),
+        )?);
+
+        Ok((final_partitioned, repartition_ref))
+    }
+
+    #[derive(Debug, Clone)]
+    struct CountingGenerator {
+        schema: SchemaRef,
+        partition: usize,
+        next_batch: usize,
+        max_batches: usize,
+        rows_per_batch: usize,
+    }
+
+    impl CountingGenerator {
+        fn new(
+            schema: SchemaRef,
+            partition: usize,
+            max_batches: usize,
+            rows_per_batch: usize,
+        ) -> Self {
+            Self {
+                schema,
+                partition,
+                next_batch: 0,
+                max_batches,
+                rows_per_batch,
+            }
+        }
+    }
+
+    impl fmt::Display for CountingGenerator {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "CountingGenerator: partition={}, max_batches={}, rows_per_batch={}",
+                self.partition, self.max_batches, self.rows_per_batch
+            )
+        }
+    }
+
+    impl LazyBatchGenerator for CountingGenerator {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+            if self.next_batch == self.max_batches {
+                return Ok(None);
+            }
+
+            let start = ((self.partition * self.max_batches + self.next_batch)
+                * self.rows_per_batch) as u64;
+            self.next_batch += 1;
+
+            let values =
+                UInt64Array::from_iter_values(start..start + self.rows_per_batch as u64);
+
+            Ok(Some(RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(values) as ArrayRef],
+            )?))
+        }
+
+        fn reset_state(&self) -> Arc<RwLock<dyn LazyBatchGenerator>> {
+            Arc::new(RwLock::new(Self {
+                schema: Arc::clone(&self.schema),
+                partition: self.partition,
+                next_batch: 0,
+                max_batches: self.max_batches,
+                rows_per_batch: self.rows_per_batch,
+            }))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "temporary diagnostic reproducer for layered cancellation delay"]
+    async fn cancellation_delay_coalesce_repartition() -> Result<()> {
+        task_lifetime_probe::clear();
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, true)]));
+        let input_partitions = 2;
+        let batches_per_input_partition = 8;
+        let rows_per_batch = 128_000;
+        let generators = (0..input_partitions)
+            .map(|partition| {
+                Arc::new(RwLock::new(CountingGenerator::new(
+                    Arc::clone(&schema),
+                    partition,
+                    batches_per_input_partition,
+                    rows_per_batch,
+                ))) as Arc<RwLock<dyn LazyBatchGenerator>>
+            })
+            .collect();
+        let input = Arc::new(LazyMemoryExec::try_new(Arc::clone(&schema), generators)?);
+        let input_refs = Arc::downgrade(&input);
+        let output_partitions = 32;
+        let (partitioned_aggregate, lower_repartition_ref) =
+            high_cardinality_partitioned_aggregate(input, &schema, output_partitions)?;
+        let lower_coalesce = Arc::new(CoalescePartitionsExec::new(partitioned_aggregate));
+        let (partitioned_aggregate, upper_repartition_ref) =
+            high_cardinality_partitioned_aggregate(
+                lower_coalesce,
+                &schema,
+                output_partitions,
+            )?;
+        let repartition_refs = vec![lower_repartition_ref, upper_repartition_ref];
+        let plan = Arc::new(CoalescePartitionsExec::new(partitioned_aggregate));
+
+        let handle = tokio::spawn(collect(plan, task_ctx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "query finished before cancellation");
+        let task_refs = task_lifetime_probe::snapshot();
+
+        let start = Instant::now();
+        handle.abort();
+
+        let (drop_times, task_drop_times) = wait_for_repartition_and_task_drop_times(
+            &repartition_refs,
+            &task_refs,
+            start,
+        )
+        .await;
+        let total_elapsed = start.elapsed();
+        let max_repartition_drop =
+            drop_times.iter().copied().max().unwrap_or(Duration::ZERO);
+        let max_task_drop = task_drop_times
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(Duration::ZERO);
+
+        for (idx, elapsed) in drop_times.into_iter().enumerate() {
+            let repartition = match idx {
+                0 => "lower",
+                1 => "upper",
+                _ => "unknown",
+            };
+            println!(
+                "{repartition}_final_partitioned_hash_repartition_drop_elapsed_ms={}",
+                elapsed.as_millis()
+            );
+        }
+        for (task, elapsed) in task_refs.iter().zip(task_drop_times) {
+            println!(
+                "repartition_task_group={} input_partition={} kind={} drop_elapsed_ms={}",
+                task.group_id,
+                task.input_partition,
+                task.task_kind,
+                elapsed.as_millis()
+            );
+        }
+        println!(
+            "output_partitions={output_partitions} input_rows_per_partition={} all_repartition_operator_drop_elapsed_ms={}",
+            batches_per_input_partition * rows_per_batch,
+            max_repartition_drop.as_millis()
+        );
+        println!(
+            "all_repartition_task_drop_elapsed_ms={}",
+            max_task_drop.as_millis()
+        );
+        println!("all_observed_drop_elapsed_ms={}", total_elapsed.as_millis());
+        println!(
+            "input_plan_strong_count_after_cancel={}",
+            input_refs.strong_count()
+        );
 
         Ok(())
     }
