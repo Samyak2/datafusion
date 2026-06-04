@@ -2594,7 +2594,8 @@ mod tests {
             .unwrap()
             .sum_by_name("peak_mem_used")
             .map(|metric| metric.as_usize())
-            .unwrap_or(0);
+            .unwrap_or(0)
+            * 30;
 
         let probe_schema = Arc::new(Schema::new(vec![Field::new(
             "probe_key",
