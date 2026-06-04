@@ -2566,7 +2566,7 @@ mod tests {
     #[tokio::test]
     async fn build_side_final_aggregate_respects_grouped_memory_limit() -> Result<()> {
         const BATCH_SIZE: usize = 8192;
-        const NUM_GROUPS: usize = BATCH_SIZE * 32 + 1;
+        const NUM_GROUPS: usize = BATCH_SIZE * 128 + 1;
         const EXPECTED_JOIN_ROWS: usize = 3;
 
         let aggregate = final_aggregate_build_side(NUM_GROUPS).await?;
@@ -2582,7 +2582,7 @@ mod tests {
             NUM_GROUPS
         );
         let aggregate_batch = concat_batches(&aggregate.schema(), &aggregate_batches)?;
-        let memory_limit = get_record_batch_memory_size(&aggregate_batch) * 4;
+        let memory_limit = get_record_batch_memory_size(&aggregate_batch) * 17;
 
         let probe_schema = Arc::new(Schema::new(vec![Field::new(
             "probe_key",
