@@ -18,10 +18,11 @@
 //! This module provides a function to estimate the memory size of a HashTable prior to allocation
 
 use crate::error::_exec_datafusion_err;
-use crate::{HashSet, Result};
+use crate::{HashMap, Result, hash_map::Entry};
 use arrow::array::ArrayData;
 use arrow::record_batch::RecordBatch;
-use std::{mem::size_of, ptr::NonNull};
+use std::mem::size_of;
+use std::num::NonZero;
 
 /// Estimates the memory size required for a hash table prior to allocation.
 ///
@@ -133,7 +134,7 @@ pub fn estimate_memory_size<T>(num_elements: usize, fixed_size: usize) -> Result
 pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
     // Store pointers to `Buffer`'s start memory address (instead of actual
     // used data region's pointer represented by current `Array`)
-    let mut counted_buffers: HashSet<NonNull<u8>> = HashSet::new();
+    let mut counted_buffers: HashMap<NonZero<usize>, usize> = HashMap::new();
     let mut total_size = 0;
 
     for array in batch.columns() {
@@ -144,28 +145,111 @@ pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
     total_size
 }
 
+/// Helper to calculate total memory used by a sequence of record batches.
+///
+/// This does buffer de-duplication across all batches instead of just within a single batch.
+#[derive(Debug, Default)]
+pub struct RecordBatchMemorySizeCalculator {
+    counted_buffers: HashMap<NonZero<usize>, usize>,
+    total_size: usize,
+}
+
+impl RecordBatchMemorySizeCalculator {
+    pub fn add_batch(&mut self, batch: &RecordBatch) -> usize {
+        for array in batch.columns() {
+            let array_data = array.to_data();
+            count_array_data_memory_size(
+                &array_data,
+                &mut self.counted_buffers,
+                &mut self.total_size,
+            );
+        }
+        self.total_size
+    }
+
+    pub fn remove_batch(&mut self, batch: &RecordBatch) -> usize {
+        for array in batch.columns() {
+            let array_data = array.to_data();
+            remove_array_from_tracking(
+                &array_data,
+                &mut self.counted_buffers,
+                &mut self.total_size,
+            );
+        }
+        self.total_size
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+}
+
 /// Count the memory usage of `array_data` and its children recursively.
 fn count_array_data_memory_size(
     array_data: &ArrayData,
-    counted_buffers: &mut HashSet<NonNull<u8>>,
+    counted_buffers: &mut HashMap<NonZero<usize>, usize>,
     total_size: &mut usize,
 ) {
     // Count memory usage for `array_data`
     for buffer in array_data.buffers() {
-        if counted_buffers.insert(buffer.data_ptr()) {
-            *total_size += buffer.capacity();
-        } // Otherwise the buffer's memory is already counted
+        add_buffer(counted_buffers, total_size, buffer);
     }
 
-    if let Some(null_buffer) = array_data.nulls()
-        && counted_buffers.insert(null_buffer.inner().inner().data_ptr())
-    {
-        *total_size += null_buffer.inner().inner().capacity();
+    if let Some(null_buffer) = array_data.nulls() {
+        add_buffer(counted_buffers, total_size, null_buffer.inner().inner());
     }
 
     // Count all children `ArrayData` recursively
     for child in array_data.child_data() {
         count_array_data_memory_size(child, counted_buffers, total_size);
+    }
+}
+
+fn add_buffer(
+    counted_buffers: &mut HashMap<NonZero<usize>, usize>,
+    total_size: &mut usize,
+    buffer: &arrow::buffer::Buffer,
+) {
+    match counted_buffers.entry(buffer.data_ptr().addr()) {
+        Entry::Vacant(entry) => {
+            entry.insert(1);
+            *total_size += buffer.capacity();
+        }
+        Entry::Occupied(mut entry) => {
+            *entry.get_mut() += 1;
+        }
+    }
+}
+
+fn remove_array_from_tracking(
+    array_data: &ArrayData,
+    counted_buffers: &mut HashMap<NonZero<usize>, usize>,
+    total_size: &mut usize,
+) {
+    for buffer in array_data.buffers() {
+        remove_buffer(counted_buffers, total_size, buffer);
+    }
+
+    if let Some(null_buffer) = array_data.nulls() {
+        remove_buffer(counted_buffers, total_size, null_buffer.inner().inner());
+    }
+
+    for child in array_data.child_data() {
+        remove_array_from_tracking(child, counted_buffers, total_size);
+    }
+}
+
+fn remove_buffer(
+    counted_buffers: &mut HashMap<NonZero<usize>, usize>,
+    total_size: &mut usize,
+    buffer: &arrow::buffer::Buffer,
+) {
+    if let Entry::Occupied(mut entry) = counted_buffers.entry(buffer.data_ptr().addr()) {
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+            *total_size -= buffer.capacity();
+        }
     }
 }
 

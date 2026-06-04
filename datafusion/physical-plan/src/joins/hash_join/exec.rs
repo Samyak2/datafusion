@@ -52,7 +52,6 @@ use crate::projection::{
     try_pushdown_through_join,
 };
 use crate::repartition::REPARTITION_RANDOM_STATE;
-use crate::spill::get_record_batch_memory_size;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics,
@@ -72,7 +71,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use arrow_schema::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::utils::memory::estimate_memory_size;
+use datafusion_common::utils::memory::{
+    RecordBatchMemorySizeCalculator, estimate_memory_size,
+};
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
     plan_err, project_schema,
@@ -1810,6 +1811,7 @@ impl CollectLeftAccumulator {
 /// State for collecting the build-side data during hash join
 struct BuildSideState {
     batches: Vec<RecordBatch>,
+    batch_memory: RecordBatchMemorySizeCalculator,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -1827,6 +1829,7 @@ impl BuildSideState {
     ) -> Result<Self> {
         Ok(Self {
             batches: Vec::new(),
+            batch_memory: RecordBatchMemorySizeCalculator::default(),
             num_rows: 0,
             metrics,
             reservation,
@@ -1919,12 +1922,13 @@ async fn collect_left_input(
                 }
             }
 
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
+            let previous_batch_size = state.batch_memory.total_size();
+            let new_batch_size = state.batch_memory.add_batch(&batch);
+            let batch_size_delta = new_batch_size - previous_batch_size;
+            // Reserve memory for the incoming batch's newly referenced buffers.
+            state.reservation.try_grow(batch_size_delta)?;
             // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
+            state.metrics.build_mem_used.add(batch_size_delta);
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
             // Update row count
@@ -1942,6 +1946,7 @@ async fn collect_left_input(
         metrics,
         mut reservation,
         bounds_accumulators,
+        ..
     } = state;
 
     // Compute bounds
@@ -2594,8 +2599,7 @@ mod tests {
             .unwrap()
             .sum_by_name("peak_mem_used")
             .map(|metric| metric.as_usize())
-            .unwrap_or(0)
-            * 30;
+            .unwrap_or(0);
 
         let probe_schema = Arc::new(Schema::new(vec![Field::new(
             "probe_key",
