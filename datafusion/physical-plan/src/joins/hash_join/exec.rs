@@ -2589,8 +2589,12 @@ mod tests {
                 .sum::<usize>(),
             NUM_GROUPS
         );
-        let aggregate_batch = concat_batches(&aggregate.schema(), &aggregate_batches)?;
-        let memory_limit = get_record_batch_memory_size(&aggregate_batch) * 17;
+        let memory_limit = aggregate
+            .metrics()
+            .unwrap()
+            .sum_by_name("peak_mem_used")
+            .map(|metric| metric.as_usize())
+            .unwrap_or(0);
 
         let probe_schema = Arc::new(Schema::new(vec![Field::new(
             "probe_key",
