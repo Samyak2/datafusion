@@ -2516,9 +2516,9 @@ mod tests {
             Arc::clone(&raw_schema),
             vec![
                 Arc::new(UInt32Array::from_iter_values(
-                    (0..num_groups).map(aggregate_join_group_key),
+                    (0..num_groups).flat_map(|i| [aggregate_join_group_key(i); 2]),
                 )),
-                Arc::new(UInt64Array::from(vec![1; num_groups])),
+                Arc::new(UInt64Array::from(vec![1; num_groups * 2])),
             ],
         )?;
         let input =
@@ -2547,6 +2547,13 @@ mod tests {
             partial_aggregate.execute(0, Arc::new(TaskContext::default()))?,
         )
         .await?;
+        let skipped_rows = partial_aggregate
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"))
+            .map(|metric| metric.as_usize())
+            .unwrap_or(0);
+        assert_eq!(skipped_rows, 0);
+
         let partial_input = TestMemoryExec::try_new_exec(
             &[partial_batches],
             Arc::clone(&partial_schema),
