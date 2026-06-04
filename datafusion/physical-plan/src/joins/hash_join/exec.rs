@@ -2580,6 +2580,7 @@ mod tests {
         let aggregate_batches =
             common::collect(aggregate.execute(0, Arc::new(TaskContext::default()))?)
                 .await?;
+        assert_eq!(aggregate.metrics().unwrap().spill_count().unwrap_or(0), 0);
         assert!(aggregate_batches.len() > 1);
         assert_eq!(
             aggregate_batches
@@ -2610,12 +2611,15 @@ mod tests {
             None,
         )?;
 
-        let aggregate: Arc<dyn ExecutionPlan> = aggregate;
+        let aggregate_plan: Arc<dyn ExecutionPlan> = aggregate.clone();
         let join = HashJoinExec::try_new(
-            Arc::clone(&aggregate),
+            Arc::clone(&aggregate_plan),
             probe,
             vec![(
-                Arc::new(Column::new_with_schema("group_key", &aggregate.schema())?) as _,
+                Arc::new(Column::new_with_schema(
+                    "group_key",
+                    &aggregate_plan.schema(),
+                )?) as _,
                 Arc::new(Column::new_with_schema("probe_key", &probe_schema)?) as _,
             )],
             None,
@@ -2629,7 +2633,9 @@ mod tests {
             .with_memory_limit(memory_limit, 1.0)
             .build_arc()?;
         let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
-        let batches = common::collect(join.execute(0, task_ctx)?).await?;
+        let result = common::collect(join.execute(0, task_ctx)?).await;
+        assert_eq!(aggregate.metrics().unwrap().spill_count().unwrap_or(0), 0);
+        let batches = result?;
         assert_eq!(
             batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             EXPECTED_JOIN_ROWS
