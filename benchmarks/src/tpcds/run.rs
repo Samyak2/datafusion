@@ -19,6 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::adaptive_join::install_adaptive_joins;
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
 
 use arrow::datatypes::Schema;
@@ -30,10 +31,16 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::*;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::instant::Instant;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::utils::get_available_parallelism;
 use datafusion_common::{Constraint, Constraints, DEFAULT_PARQUET_EXTENSION, plan_err};
 
@@ -204,6 +211,19 @@ pub struct RunOpt {
     /// How many bytes to buffer on the probe side of hash joins.
     #[arg(long, default_value = "0")]
     hash_join_buffering_capacity: usize,
+
+    /// Disable this draft's StageBoundary join experiment and use the default planner.
+    #[arg(long, env = "DFBENCH_DISABLE_ADAPTIVE_JOINS")]
+    disable_adaptive_joins: bool,
+
+    /// Experiment: partition when total buffered build Arrow array memory reaches
+    /// this many bytes. Includes array overhead; shared buffers may count repeatedly.
+    #[arg(
+        long,
+        env = "DFBENCH_ADAPTIVE_JOIN_THRESHOLD_BYTES",
+        default_value = "2621440"
+    )]
+    adaptive_join_threshold_bytes: usize,
 }
 
 impl RunOpt {
@@ -226,6 +246,11 @@ impl RunOpt {
             self.hash_join_buffering_capacity;
         let rt = self.common.build_runtime()?;
         let ctx = SessionContext::new_with_config_rt(config, rt);
+        let ctx = if self.disable_adaptive_joins {
+            ctx
+        } else {
+            collect_left_context(&ctx)
+        };
         benchmark_run.set_memory_pool(&ctx.runtime_env().memory_pool);
         // register tables
         self.register_tables(&ctx).await?;
@@ -337,6 +362,15 @@ impl RunOpt {
             println!("=== Optimized logical plan ===\n{plan}\n");
         }
         let physical_plan = state.create_physical_plan(&plan).await?;
+        let physical_plan = if self.disable_adaptive_joins {
+            physical_plan
+        } else {
+            install_adaptive_joins(
+                physical_plan,
+                &state.task_ctx(),
+                self.adaptive_join_threshold_bytes,
+            )?
+        };
         if debug {
             println!(
                 "=== Physical plan ===\n{}\n",
@@ -418,5 +452,115 @@ impl RunOpt {
         self.common
             .partitions
             .unwrap_or_else(get_available_parallelism)
+    }
+}
+
+fn collect_left_context(ctx: &SessionContext) -> SessionContext {
+    let state = ctx.state();
+    let mut rules = state.physical_optimizers().to_vec();
+    let selection = rules
+        .iter()
+        .position(|rule| rule.name() == "join_selection")
+        .expect("default optimizer includes join selection");
+    // Preserve the default build side, before distribution requirements add
+    // join-specific probe exchanges.
+    rules.insert(selection + 1, Arc::new(ForceCollectLeft));
+    SessionContext::new_with_state(
+        SessionStateBuilder::from(state)
+            .with_physical_optimizer_rules(rules)
+            .build(),
+    )
+}
+
+#[derive(Debug)]
+struct ForceCollectLeft;
+
+impl PhysicalOptimizerRule for ForceCollectLeft {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(plan
+            .transform_up(|plan| {
+                let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
+                    return Ok(Transformed::no(plan));
+                };
+                if *join.partition_mode() == PartitionMode::CollectLeft {
+                    return Ok(Transformed::no(plan));
+                }
+                Ok(Transformed::yes(
+                    join.builder()
+                        .with_partition_mode(PartitionMode::CollectLeft)
+                        .recompute_properties()
+                        .build_exec()?,
+                ))
+            })?
+            .data)
+    }
+
+    fn name(&self) -> &str {
+        "benchmark_force_collect_left"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod adaptive_planner_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion_common::tree_node::TreeNodeRecursion;
+
+    #[tokio::test]
+    async fn forced_collect_left_precedes_distribution_enforcement() -> Result<()> {
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
+        let ctx = SessionContext::new_with_config(config);
+        for table in ["l", "r"] {
+            let batch = RecordBatch::try_from_iter(vec![(
+                "k",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            )])?;
+            ctx.register_batch(table, batch)?;
+        }
+        let sql = "SELECT l.k FROM l JOIN r ON l.k = r.k ORDER BY l.k";
+        let baseline = ctx.sql(sql).await?.create_physical_plan().await?;
+        let mut modes = vec![];
+        baseline.apply(|node| {
+            if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+                modes.push(*join.partition_mode());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(modes, vec![PartitionMode::Partitioned]);
+        let expected = collect(baseline, ctx.task_ctx()).await?;
+        let ctx = collect_left_context(&ctx);
+        let forced = ctx.sql(sql).await?.create_physical_plan().await?;
+        let mut modes = vec![];
+        forced.apply(|node| {
+            if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+                modes.push(*join.partition_mode());
+                assert_eq!(join.left().output_partitioning().partition_count(), 1);
+                assert!(!matches!(
+                    join.right().output_partitioning(),
+                    datafusion::physical_plan::Partitioning::Hash(_, _)
+                ));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(modes, vec![PartitionMode::CollectLeft]);
+        assert_eq!(expected, collect(forced, ctx.task_ctx()).await?);
+        Ok(())
     }
 }
