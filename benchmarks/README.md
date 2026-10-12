@@ -754,31 +754,69 @@ directly against `data/wide_schema/{wide,narrow}/`.
 
 ## TPCDS
 
-Run the tpcds benchmark.
-
-For data please clone `datafusion-benchmarks` repo which contains the predefined parquet data with SF1.
+Run the TPC-DS SF1 benchmark from the `benchmarks` directory:
 
 ```shell
-git clone https://github.com/apache/datafusion-benchmarks
+./bench.sh data tpcds
+./bench.sh run tpcds
+# Or run a single query:
+./bench.sh run tpcds 30
 ```
 
-Then run the benchmark with the following command:
+### Experimental runtime hash join selection
+
+This draft enables a benchmark-only `StageBoundary` experiment by default in
+`dfbench tpcds`. The normal `./bench.sh run tpcds` command, including the PR comment
+benchmark runner, therefore exercises it without additional flags. Other benchmark
+commands and DataFusion's library defaults are unchanged.
+
+The planner first chooses the build side as usual, then starts hash joins in
+`CollectLeft` mode before enforcing input distributions. During execution, a stage
+boundary buffers the build input and measures its total Arrow array memory size.
+Builds below **2.5 MiB (2,621,440 bytes)** stay `CollectLeft`; builds at or above the
+threshold switch to `Partitioned`, adding hash exchanges on both inputs. Probe
+streams start before waiting for the build, preserving startup of independent
+subtrees. The threshold is total build input size, not per partition or hash-table
+size; shared Arrow buffers may be counted repeatedly.
+
+Compare the experiment with the default planner on the same checkout:
 
 ```shell
-DATA_DIR=../../datafusion-benchmarks/tpcds/data/sf1/ ./benchmarks/bench.sh run tpcds
+# Run from benchmarks/. Use the same build, data, and machine for both runs.
+DFBENCH_DISABLE_ADAPTIVE_JOINS=true RESULTS_NAME=default ./bench.sh run tpcds
+RESULTS_NAME=adaptive ./bench.sh run tpcds
+./bench.sh compare default adaptive
+./bench.sh compare_detail default adaptive
 ```
 
-Alternatively benchmark the specific query
+Both runs record five iterations per query and discard none. `compare` uses the
+minimum of five; `compare_detail` reports mean and standard deviation separately.
+The normal harness reuses one session per process and creates fresh plans for each
+iteration. There is no extra warmup or cache flush. Repeat in reverse order to
+check sensitivity to run order.
+
+To try another threshold through the same script:
 
 ```shell
-DATA_DIR=../../datafusion-benchmarks/tpcds/data/sf1/ ./benchmarks/bench.sh run tpcds 30
+DFBENCH_ADAPTIVE_JOIN_THRESHOLD_BYTES=4194304 RESULTS_NAME=adaptive-4mib ./bench.sh run tpcds
 ```
 
-More help
+The equivalent direct CLI options are `--disable-adaptive-joins` and
+`--adaptive-join-threshold-bytes`. For example, from the repository root:
 
 ```shell
+cargo run --release --bin dfbench -- tpcds --iterations 5 \
+  --path benchmarks/data/tpcds_sf1 --query_path datafusion/core/tests/tpc-ds \
+  --adaptive-join-threshold-bytes 2621440 -o /tmp/tpcds-adaptive.json
 cargo run --release --bin dfbench -- tpcds --help
 ```
+
+This is an experiment, not a production adaptive planner: it buffers the complete
+build before deciding, does not spill these buffers, retains the planner's build
+side, and leaves null-aware joins in `CollectLeft`. Runtime-added exchange metrics
+are not included in the static plan's metrics traversal. The threshold was tuned
+on local SF1 with 14 partitions; it has not been established as a general default
+for larger data or different hardware.
 
 ## External Aggregation
 
